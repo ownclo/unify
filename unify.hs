@@ -1,15 +1,13 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 import Data.Binary
 import Data.Binary.Put
 import Data.Binary.Get
 
 import qualified Control.Lens as L
-import Control.Applicative
 import Control.Monad
 import Control.Monad.Operational
 
@@ -24,10 +22,42 @@ data IsoM f b v = (Monad f, Monad b) => IsoM
     , backward :: b v       -- parser
     }
 
-data SerializerStep f b a v = Step (IsoM f b v) (L.Lens' a v)
---     Step :: IsoM f b v -> L.Lens' a v -> SerializerStep f b v a
-
+data SerializerStep f b a v = (Monad f, Monad b) => Step (IsoM f b v) (L.Lens' a v)
 type Description f b a = Program (SerializerStep f b a)
+
+mkIso :: (Monad f, Monad b) => Description f b a a -> IsoM f b a
+mkIso desc = IsoM forw backw
+    where forw = printD desc
+          backw = parseD desc
+
+repeatIso :: (Monad f, Monad b)
+          => Int -> IsoM f b v -> IsoM f b [v]
+repeatIso num iso = IsoM forw back
+    where forw = mapM_ (forward iso)            -- :: [v] -> f ()
+          back = replicateM num $ backward iso  -- :: b [v]
+
+times :: (Monad f, Monad b)
+      => Int -> IsoM f b v
+      -> L.Lens' a [v] -> Description f b a [v]
+times num iso lens = singleton $ Step (repeatIso num iso) lens
+
+parseD :: (Monad f, Monad b) => Description f b a a -> b a
+parseD = eval . view
+    where eval :: (Monad f, Monad b) => ProgramView (SerializerStep f b a) a -> b a
+          eval (Return val) = return val
+          eval (Step iso _ :>>= k) = do
+              x <- backward iso
+              eval . view $ k x
+
+-- initial value is used for lensing (it's printed out)
+printD :: (Monad f, Monad b) => Description f b a a -> a -> f ()
+printD desc val = eval val $ view desc
+    where eval :: (Monad f, Monad b) => a -> ProgramView (SerializerStep f b a) v -> f ()
+          eval _ (Return _) = return ()
+          eval v (Step iso lens :>>= k) = do
+              let x = L.view lens v
+              forward iso x
+              eval v . view $ k x
 
 byteIso :: IsoM PutM Get Word8
 byteIso = IsoM put get
@@ -35,38 +65,11 @@ byteIso = IsoM put get
 byte :: L.Lens' a Word8 -> Description PutM Get a Word8
 byte lens = singleton $ Step byteIso lens
 
-times :: (Monad f, Monad b)
-      => Int -> IsoM f b v
-      -> L.Lens' a [v] -> Description f b a [v]
-times num iso lens = singleton $ Step repeatIso lens
-    where repeatIso = IsoM forw back
-          forw = mapM_ (forward iso)
-          back = replicateM num $ backward iso
-
-fooDesc :: Description PutM Get Foo ()
-fooDesc = do
-    len <- fromIntegral <$> byte n
-    void $ times len byteIso lst
-
--- lenses modify initial value
-parseD :: (Monad f, Monad b) => a -> Description f b a v -> b a
-parseD initVal desc = eval initVal $ view desc
-    where eval :: (Monad f, Monad b) => a -> ProgramView (SerializerStep f b a) v -> b a
-          eval val (Return _) = return val
-          eval val (Step iso lens :>>= k) = do
-              x <- backward iso
-              let val' = L.set lens x val
-              eval val' $ view (k x)
-
--- initial value is used for lensing
-printD :: (Monad f, Monad b) => a -> Description f b a v -> f ()
-printD val desc = eval val $ view desc
-    where eval :: (Monad f, Monad b) => a -> ProgramView (SerializerStep f b a) v -> f ()
-          eval _ (Return _) = return ()
-          eval v (Step iso lens :>>= k) = do
-              let x = L.view lens v
-              forward iso x
-              eval v $ view (k x)
+fooIso :: IsoM PutM Get Foo
+fooIso = mkIso $ do
+    n'   <- byte n
+    lst' <- times (fromIntegral n') byteIso lst
+    return $ Foo n' lst'
 
 instance Binary Foo where
 --     get :: Get Foo
@@ -82,11 +85,8 @@ instance Binary Foo where
 
 main :: IO ()
 main = do
---     print $ L.view n foo
---     print $ L.set lst [8 :: Word8 ,2,3] foo
-
-    let encoDesc = runPut (printD foo fooDesc)
-    print $ runGet (parseD nilFoo fooDesc) encoDesc
+    let encoDesc = runPut $ forward fooIso foo
+    print $ runGet (backward fooIso) encoDesc
 
     let enco = encode foo
         deco = decode enco
@@ -94,4 +94,3 @@ main = do
     print $ deco == foo
 
     where foo = Foo 6 [1,2,3,4,5,6]
-          nilFoo = Foo 0 []
